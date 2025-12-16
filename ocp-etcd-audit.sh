@@ -3,8 +3,8 @@
 # ====================================================================================
 # Script Name: ocp-etcd-audit.sh
 # Target:      OpenShift 4.x (Universal)
-# Description: Audits ETCD health, DB size, fragmentation, and object distribution.
-#              Fixed formatting (Custom Columns & JSON Parsing).
+# Description: ETCD Audit Tool.
+#              Logic: Always sorts by object count. -s adds size column to the top N items.
 # Usage:       ./ocp-etcd-audit.sh [options]
 # ====================================================================================
 
@@ -29,10 +29,10 @@ usage() {
     echo -e "${BOLD}OpenShift ETCD Audit Tool${NC}"
     echo -e "Usage: $0 [OPTIONS]"
     echo -e "\nOptions:"
-    echo -e "  -n <number>        Show top <number> storage consumers (Default: 15)"
-    echo -e "  -a, --all          Show ALL storage consumers"
-    echo -e "  -s, --size         Calculate JSON representation size (Focus Mode)"
-    echo -e "                     ${YELLOW}Note: JSON is approx. 3x larger than actual ETCD binary storage.${NC}"
+    echo -e "  -n <number>        Show top <number> objects by COUNT (Default: 15)"
+    echo -e "  -a, --all          Show ALL objects (sorted by count)"
+    echo -e "  -s, --size         Add JSON size column to the output list"
+    echo -e "                     ${YELLOW}Note: Calculates size only for the displayed items.${NC}"
     echo -e "  -e, --exact <res>  Calculate EXACT size via ETCD for ONE resource (Focus Mode)"
     echo -e "                     ${RED}WARNING: Creates high I/O load on ETCD directly!${NC}"
     echo -e "  -y, --yes          Skip interactive confirmations"
@@ -70,7 +70,6 @@ if ! oc whoami &> /dev/null; then
 fi
 
 # 2. Pod Selection
-# Wir nutzen app=etcd, um sicherzustellen, dass wir einen echten Member erwischen
 ETCD_POD=$(oc get pods -n openshift-etcd -l app=etcd --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
 
 if [ -z "$ETCD_POD" ]; then
@@ -146,19 +145,16 @@ if [ "$FULL_REPORT" = true ]; then
         echo -e "ETCD Operator Status: ${RED}UNHEALTHY! Check 'oc get co etcd'${NC}"
     fi
 
-    # ------------------------------------------------------------------------------------
-    # SECTION 2: POD DETAILS (FIXED with custom-columns)
-    # ------------------------------------------------------------------------------------
+    # SECTION 2: POD DETAILS
     echo -e "\n${BOLD}2. ETCD Member Pod Details:${NC}"
     echo "------------------------------------------------------------------------------------------------------------------------"
-    # Using custom-columns to prevent misalignment with long hostnames.
     oc get pods -n openshift-etcd -l app=etcd -o custom-columns="NAME:.metadata.name,NODE:.spec.nodeName,STATUS:.status.phase,IP:.status.podIP,RESTARTS:.status.containerStatuses[0].restartCount,START_TIME:.metadata.creationTimestamp"
     echo "------------------------------------------------------------------------------------------------------------------------"
 fi
 
 
 # ------------------------------------------------------------------------------------
-# SECTION 3: DATABASE SIZE & FRAGMENTATION (RESTORED ORIGINAL LOGIC)
+# SECTION 3: DATABASE SIZE & FRAGMENTATION
 # ------------------------------------------------------------------------------------
 if [ "$FULL_REPORT" = true ]; then
     echo -e "\n${BOLD}3. Database Size & Fragmentation (Endpoint Status):${NC}"
@@ -173,35 +169,24 @@ if [ "$FULL_REPORT" = true ]; then
         exit 1
     fi
 
-    # WICHTIG: Hier nutzen wir wieder DEINE ursprüngliche Logik (sed + grep),
-    # weil die zuverlässiger mit der JSON-Struktur von OCP Etcd umgeht als mein vorheriger Versuch.
     echo "$RAW_JSON" | sed 's/{"Endpoint"/\n{"Endpoint"/g' | grep '"Endpoint"' | while read -r line; do
-        
         NODE_IP=$(echo "$line" | grep -o '"Endpoint":"[^"]*"' | sed 's/.*"https:\/\///;s/:.*//')
         SIZE_BYTES=$(echo "$line" | grep -o '"dbSize":[0-9]*' | awk -F: '{print $2}')
         USED_BYTES=$(echo "$line" | grep -o '"dbSizeInUse":[0-9]*' | awk -F: '{print $2}')
         
-        # Fallback auf 0, falls leer, um Rechenfehler zu vermeiden
         SIZE_MB=0; USED_MB=0
         if [ ! -z "$SIZE_BYTES" ]; then SIZE_MB=$((SIZE_BYTES / 1024 / 1024)); fi
         if [ ! -z "$USED_BYTES" ]; then USED_MB=$((USED_BYTES / 1024 / 1024)); fi
         
         SIZE_DISPLAY="${SIZE_MB} MB"
         if [ "$SIZE_MB" -gt 1500 ]; then SIZE_DISPLAY="${RED}${SIZE_MB} MB (!)${NC}"; fi
-        
         USED_DISPLAY="${USED_MB} MB"
         
         FRAG_MSG=""
         if [ "$SIZE_MB" -gt 0 ]; then
              FRAG_VAL=$(( (SIZE_MB - USED_MB) * 100 / SIZE_MB ))
-             
-             if [ "$FRAG_VAL" -gt 45 ]; then 
-                FRAG_MSG="${RED}${FRAG_VAL}% (High)${NC}"
-             else 
-                FRAG_MSG="${GREEN}${FRAG_VAL}%${NC}"
-             fi
+             if [ "$FRAG_VAL" -gt 45 ]; then FRAG_MSG="${RED}${FRAG_VAL}% (High)${NC}"; else FRAG_MSG="${GREEN}${FRAG_VAL}%${NC}"; fi
         fi
-
         printf "%-25s %-15s %-15s %-20b\n" "$NODE_IP" "$SIZE_DISPLAY" "$USED_DISPLAY" "$FRAG_MSG"
     done
     echo "--------------------------------------------------------------------------------"
@@ -210,48 +195,65 @@ fi
 
 
 # ------------------------------------------------------------------------------------
-# OBJECT ANALYSIS (Full Report OR if -s is active)
+# OBJECT ANALYSIS (Classic Workflow: Sort by Count)
 # ------------------------------------------------------------------------------------
 if [ "$FULL_REPORT" = true ] || [ "$CALC_SIZE" = true ]; then
 
-    if [ "$SHOW_ALL" = true ]; then DISPLAY_TEXT="ALL objects"; PIPELINE_CMD="cat"; else DISPLAY_TEXT="Top $LIMIT objects"; PIPELINE_CMD="head -n $LIMIT"; fi
+    # FILTER LOGIC: Always sort by count, filter early.
+    if [ "$SHOW_ALL" = true ]; then 
+        DISPLAY_TEXT="ALL objects"; 
+        FILTER_CMD="cat"
+    else 
+        DISPLAY_TEXT="Top $LIMIT objects by Count"; 
+        FILTER_CMD="head -n $LIMIT"
+    fi
 
     echo -e "\n${BOLD}4. Storage Consumers ($DISPLAY_TEXT):${NC}"
 
     if [ "$CALC_SIZE" = true ]; then
-        echo -e "${YELLOW}Source: API Server (JSON Export). Size is approx. 3x larger than binary ETCD storage.${NC}"
+        # HEADER WITH SIZE
+        echo -e "${YELLOW}Source: API Server Metrics. Ordered by Count. Includes Size Calculation.${NC}"
         echo "------------------------------------------------------------------------------------------"
         printf "%-10s %-45s %-25s\n" "Count" "Resource" "Est. JSON Size (API)"
         echo "------------------------------------------------------------------------------------------"
         
-        echo -e "${RED}Calculating sizes via API (This generates CPU load on API server)...${NC}"
-        if [ "$CONFIRM_ALL" = false ]; then
-            read -p "Are you sure? (y/N): " confirm
+        # Only warn if we are calculating MANY items (Show All)
+        if [ "$SHOW_ALL" = true ] && [ "$CONFIRM_ALL" = false ]; then
+            echo -e "${RED}Calculating size for ALL items generates load.${NC}"
+            read -p "Proceed? (y/N): " confirm
             if [[ ! "$confirm" =~ ^[Yy]$ ]]; then exit 0; fi
         fi
+
     else
+        # HEADER STANDARD
         echo -e "${YELLOW}Source: API Server Metrics. Ordered by Object Count.${NC}"
         echo "------------------------------------------------------------"
         printf "%-10s %-50s\n" "Count" "Resource"
         echo "------------------------------------------------------------"
     fi
 
+    # MAIN LOOP: Always Sort by Count -> Filter Top N -> Loop
     oc get --raw /metrics | grep 'apiserver_storage_objects' | grep -v '#' | \
     awk '{ match($0, /resource="([^"]+)"/, m); print $2, m[1] }' | \
     awk '{a[$2]+=$1} END {for (i in a) print a[i], i}' | \
-    sort -nr | $PIPELINE_CMD | \
+    sort -nr | $FILTER_CMD | \
     while read count resource; do
         if [ "$count" -gt 20000 ]; then C_COLOR=$RED; elif [ "$count" -gt 10000 ]; then C_COLOR=$YELLOW; else C_COLOR=$NC; fi
 
         if [ "$CALC_SIZE" = true ]; then
+            # Just calculate size for this specific item in the list
             SIZE_BYTES=$(oc get "$resource" --all-namespaces -o json --ignore-not-found 2>/dev/null | wc -c)
+            
             if [ "$SIZE_BYTES" -gt 1048576 ]; then SIZE_STR="$((SIZE_BYTES / 1024 / 1024)) MB"; else SIZE_STR="$((SIZE_BYTES / 1024)) KB"; fi
             if [ "$SIZE_BYTES" -gt 104857600 ]; then S_COLOR=$RED; elif [ "$SIZE_BYTES" -gt 52428800 ]; then S_COLOR=$YELLOW; else S_COLOR=$NC; fi
+            
             printf "${C_COLOR}%-10s${NC} %-45s ${S_COLOR}%-25s${NC}\n" "$count" "$resource" "$SIZE_STR"
         else
+            # Standard output
             printf "${C_COLOR}%-10s${NC} %-50s\n" "$count" "$resource"
         fi
     done
+
     if [ "$CALC_SIZE" = true ]; then echo "------------------------------------------------------------------------------------------"; else echo "------------------------------------------------------------"; fi
 fi
 
