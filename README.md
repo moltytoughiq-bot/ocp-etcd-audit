@@ -49,6 +49,7 @@ The script uses a safe-by-default approach. Hazardous operations require explici
 | `-e <res>` | **Exact Mode:** Calculate the exact physical size for **ONE** specific resource (e.g., `-e secrets`). |
 | `-l`, `--logs` | **Log Mode:** Show ALL slow request log entries (Focus Mode). |
 | `-t`, `--since`| Set log lookback duration (e.g., `30m`, `48h`). Use 'h', not 'd'. Default: `1h`. |
+| `-p`, `--print`| **Plain Mode:** Disable colors/formatting for clean copy-paste (Alias: `--no-color`). |
 | `-y`, `--yes` | Skip interactive confirmations (Ignored in Forensic Mode). |
 | `--forensic` | **Forensic Mode:** Deep scan of ALL resources to measure exact physical size on disk. |
 | `--throttle` | Set wait time (sec) between forensic checks to reduce I/O load (Default: 1s). |

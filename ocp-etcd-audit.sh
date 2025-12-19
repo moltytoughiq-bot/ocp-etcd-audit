@@ -2,7 +2,7 @@
 
 # ====================================================================================
 # Script Name: ocp-etcd-audit.sh
-# Target:      OpenShift 4.x (Universal)
+# Target:      OpenShift 4.x (Universal - Linux & MacOS)
 # Author:      Chris Tawfik (ctawfik@redhat.com) | toughIQ (toughiq@gmail.com)
 #              (with support from Gemini AI)
 # Description: ETCD Audit Tool for Admins.
@@ -10,7 +10,7 @@
 # Usage:       ./ocp-etcd-audit.sh [options]
 # ====================================================================================
 
-# Formatting / Colors
+# Formatting / Colors (Default: On)
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -29,6 +29,7 @@ FORENSIC_MODE=false
 THROTTLE_SEC=1
 SHOW_LOGS=false
 SINCE="1h"
+NO_COLOR=false
 
 # Function: Usage Help
 usage() {
@@ -41,6 +42,7 @@ usage() {
     echo -e "  -e, --exact <res>  Calculate EXACT size via ETCD for ONE resource (Focus Mode)"
     echo -e "  -l, --logs         Show ALL slow request log entries (Focus Mode)"
     echo -e "  -t, --since <time> Set log lookback duration (e.g., 30m, 48h). Use 'h' (no 'd'). Default: 1h"
+    echo -e "  -p, --print        Disable colors/formatting for clean copy-paste (Alias: --no-color)"
     echo -e "  -y, --yes          Skip interactive confirmations (Disabled in Forensic Mode)"
     
     echo -e "\n${RED}Dangerous Options:${NC}"
@@ -77,6 +79,9 @@ while [[ "$#" -gt 0 ]]; do
             SINCE="$2"
             shift
             ;;
+        -p|--print|--no-color)
+            NO_COLOR=true
+            ;;
         --forensic)
             FORENSIC_MODE=true
             FULL_REPORT=false
@@ -91,6 +96,16 @@ while [[ "$#" -gt 0 ]]; do
     esac
     shift
 done
+
+# Apply No-Color Logic
+if [ "$NO_COLOR" = true ]; then
+    RED=""
+    GREEN=""
+    YELLOW=""
+    BLUE=""
+    BOLD=""
+    NC=""
+fi
 
 echo -e "${BLUE}${BOLD}>>> Starting OpenShift ETCD Audit...${NC}"
 
@@ -149,8 +164,9 @@ if [ "$FORENSIC_MODE" = true ]; then
     echo "---------------------------------------------------------------------------------------------------"
     
     # Iterate API Resources
+    # FIX: Replaced GNU awk 'match' array with portable 'sub' logic for MacOS compatibility
     oc get --raw /metrics | grep 'apiserver_storage_objects' | grep -v '#' | \
-    awk '{ match($0, /resource="([^"]+)"/, m); print $2, m[1] }' | \
+    awk '{ count=$2; sub(/.*resource="/, "", $0); sub(/".*/, "", $0); print count, $0 }' | \
     awk '{a[$2]+=$1} END {for (i in a) print a[i], i}' | \
     sort -nr | \
     while read api_count resource; do
@@ -303,8 +319,10 @@ if [ "$FULL_REPORT" = true ] || [ "$CALC_SIZE" = true ] || [ "$SHOW_ALL" = true 
     [ "$SHOW_ALL" = true ] && FILTER_CMD="cat"
 
     LIST_BUFFER=$(mktemp)
+    
+    # FIX: Replaced GNU awk 'match' array with portable 'sub' logic for MacOS compatibility
     oc get --raw /metrics | grep 'apiserver_storage_objects' | grep -v '#' | \
-    awk '{ match($0, /resource="([^"]+)"/, m); print $2, m[1] }' | \
+    awk '{ count=$2; sub(/.*resource="/, "", $0); sub(/".*/, "", $0); print count, $0 }' | \
     awk '{a[$2]+=$1} END {for (i in a) print a[i], i}' | \
     sort -nr | $FILTER_CMD > "$LIST_BUFFER"
 
